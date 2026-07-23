@@ -24,13 +24,6 @@ enum UIMode {
   MODE_SCENE_APPLY
 };
 
-// Scene Definition
-struct Scene {
-  const char* name;
-  const char* icon;
-  uint32_t color;
-};
-
 // Home Assistant client
 HomeAssistantClient haClient;
 
@@ -42,6 +35,9 @@ struct HAScene {
 
 HAScene haScenes[8];
 int haSceneCount = 0;
+
+const unsigned long SCENE_REFRESH_MS = 30000;
+unsigned long lastSceneRefresh = 0;
 
 // Application State
 namespace State {
@@ -68,19 +64,16 @@ namespace State {
   bool needsRedraw = true;
 }
 
-// Scene Library
-const Scene scenes[] = {
-  {"Relax", "weekend", 0x9b7cff},
-  {"Movie", "movie", 0x4aa8ff},
-  {"Dinner", "restaurant", 0xff8a3d},
-  {"Reading", "menu_book", 0xffc24a},
-  {"Party", "local_bar", 0xff5ecb},
-  {"Night", "bedtime", 0xff6a2a}
+const uint32_t scenePalette[] = {
+  0x9b7cff, 0x4aa8ff, 0xff8a3d, 0xffc24a, 0xff5ecb, 0xff6a2a, 0x4fd08a, 0x7cd8ff
 };
-const uint8_t sceneCount = 6;
+
+const char* sceneName(int i) { return haScenes[i].name; }
+uint32_t sceneColor(int i) { return scenePalette[i % 8]; }
 
 // Forward declarations
 void updateDisplay();
+void refreshScenes();
 void handleEncoder();
 void handleButton();
 void handleTouch();
@@ -116,25 +109,41 @@ void setup() {
   if (haClient.connectWiFi()) {
     M5Dial.Display.fillScreen(TFT_BLACK);
     M5Dial.Display.drawString("Fetching scenes...", 120, 120);
-
-    // Fetch scenes from Home Assistant
-    HomeAssistantClient::Scene haScenesData[8];
-    if (haClient.fetchAreaScenes(haScenesData, 8, haSceneCount)) {
-      for (int i = 0; i < haSceneCount; i++) {
-        strcpy(haScenes[i].entityId, haScenesData[i].entityId);
-        strcpy(haScenes[i].name, haScenesData[i].name);
-      }
-      Serial.printf("[Setup] Found %d scenes\n", haSceneCount);
-    } else {
-      Serial.println("[Setup] Failed to fetch scenes");
-    }
+    refreshScenes();
   } else {
-    Serial.println("[Setup] WiFi connection failed");
+    Serial.println("[Setup] WiFi connection failed - no scenes available");
   }
 
   Serial.println("Hardware initialized - Phase 2 UI ready");
   State::needsRedraw = true;
   updateDisplay();
+}
+
+// Re-reads the labelled scene list so newly labelled scenes appear without a reboot.
+void refreshScenes() {
+  lastSceneRefresh = millis();
+
+  HomeAssistantClient::Scene fetched[8];
+  int fetchedCount = 0;
+  if (!haClient.fetchAreaScenes(fetched, 8, fetchedCount)) return;
+
+  bool changed = (fetchedCount != haSceneCount);
+  for (int i = 0; i < fetchedCount && !changed; i++) {
+    changed = strcmp(haScenes[i].entityId, fetched[i].entityId) != 0 ||
+              strcmp(haScenes[i].name, fetched[i].name) != 0;
+  }
+  if (!changed) return;
+
+  for (int i = 0; i < fetchedCount; i++) {
+    strcpy(haScenes[i].entityId, fetched[i].entityId);
+    strcpy(haScenes[i].name, fetched[i].name);
+  }
+  haSceneCount = fetchedCount;
+
+  if (State::sceneIndex >= haSceneCount) State::sceneIndex = 0;
+  if (State::sceneShown >= haSceneCount) State::sceneShown = 0;
+  State::needsRedraw = true;
+  Serial.printf("[Scenes] Updated: %d scenes\n", haSceneCount);
 }
 
 void loop() {
@@ -143,6 +152,11 @@ void loop() {
   handleEncoder();
   handleButton();
   handleTouch();
+
+  // Pick up newly labelled scenes without a power cycle
+  if (millis() - lastSceneRefresh > SCENE_REFRESH_MS) {
+    refreshScenes();
+  }
 
   // Check for mode transitions (scene apply timeout)
   if (State::mode == MODE_SCENE_APPLY && (millis() - State::sceneApplyTime > 1000)) {
@@ -180,18 +194,19 @@ void handleEncoder() {
       }
       State::encoderPosition = currentPos;
     }
-  } else if (State::mode == MODE_SCENE_SELECT) {
+  } else if (State::mode == MODE_SCENE_SELECT && haSceneCount > 0) {
     // One scene per detent click (divide by 4 for discrete steps)
     int selectorValue = currentPos / 4;
     int lastSelectorValue = State::encoderPosition / 4;
 
     if (selectorValue != lastSelectorValue) {
-      // Calculate how many steps changed
       int stepDelta = selectorValue - lastSelectorValue;
-      State::sceneIndex = (State::sceneIndex + stepDelta + (sceneCount * 10)) % sceneCount;
+      int next = ((int)State::sceneIndex + stepDelta) % haSceneCount;
+      if (next < 0) next += haSceneCount;
+      State::sceneIndex = next;
       State::sceneShown = State::sceneIndex;
       State::needsRedraw = true;
-      Serial.printf("[Encoder] Scene: %s (step delta: %d)\n", scenes[State::sceneIndex].name, stepDelta);
+      Serial.printf("[Encoder] Scene: %s (step delta: %d)\n", sceneName(State::sceneIndex), stepDelta);
       State::encoderPosition = currentPos;
     }
   }
@@ -225,6 +240,10 @@ void handleTouch() {
 }
 
 void enterSceneMode() {
+  if (haSceneCount == 0) {
+    Serial.println("[Mode] No scenes available");
+    return;
+  }
   State::mode = MODE_SCENE_SELECT;
   State::modeChangeTime = millis();
   State::sceneIndex = State::sceneShown;
@@ -236,7 +255,7 @@ void applyScene() {
   State::mode = MODE_SCENE_APPLY;
   State::sceneApplyTime = millis();
   State::needsRedraw = true;
-  Serial.printf("[Scene] Applied: %s\n", scenes[State::sceneIndex].name);
+  Serial.printf("[Scene] Applied: %s\n", sceneName(State::sceneIndex));
 
   // Activate the corresponding Home Assistant scene
   if (haSceneCount > 0 && State::sceneIndex < haSceneCount) {
@@ -297,15 +316,15 @@ void displayBrightnessMode(M5GFX& disp) {
 }
 
 void displaySceneSelectMode(M5GFX& disp) {
-  Scene current = scenes[State::sceneIndex];
+  if (haSceneCount == 0) return;
+  uint16_t accent = colorTo565(sceneColor(State::sceneIndex));
 
   // Brightness arc indicator (around the perimeter)
-  uint16_t brightColor = colorTo565(0xf2a93b);
-  drawBrightnessArc(disp, State::brightness, brightColor);
+  drawBrightnessArc(disp, State::brightness, colorTo565(0xf2a93b));
 
   // Scene icon (centered)
   disp.setTextSize(5);
-  disp.setTextColor(colorTo565(current.color), TFT_BLACK);
+  disp.setTextColor(accent, TFT_BLACK);
   disp.setTextDatum(middle_center);
   disp.drawString("*", 120, 75);  // Placeholder for icon
 
@@ -313,40 +332,37 @@ void displaySceneSelectMode(M5GFX& disp) {
   disp.setTextSize(2);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
   disp.setTextDatum(middle_center);
-  disp.drawString(current.name, 120, 145);
+  disp.drawString(sceneName(State::sceneIndex), 120, 145);
 
   // Position indicator (centered)
   disp.setTextSize(1);
   disp.setTextColor(TFT_DARKGREY, TFT_BLACK);
   disp.setTextDatum(middle_center);
   char posStr[10];
-  sprintf(posStr, "%d/%d", State::sceneIndex + 1, sceneCount);
+  sprintf(posStr, "%d/%d", State::sceneIndex + 1, haSceneCount);
   disp.drawString(posStr, 120, 175);
 
   // Status dots (scene indicators) - centered at bottom
   int dotY = 210;
   int dotSpacing = 18;
-  int dotsWidth = (sceneCount - 1) * dotSpacing;
-  int startX = 120 - (dotsWidth / 2);
+  int startX = 120 - (((haSceneCount - 1) * dotSpacing) / 2);
 
-  for (int i = 0; i < sceneCount; i++) {
-    uint16_t dotColor = (i == State::sceneIndex)
-      ? colorTo565(current.color)
-      : colorTo565(0x333333);
+  for (int i = 0; i < haSceneCount; i++) {
+    uint16_t dotColor = (i == State::sceneIndex) ? accent : colorTo565(0x333333);
     disp.fillCircle(startX + (i * dotSpacing), dotY, 3, dotColor);
   }
 }
 
 void displaySceneApplyMode(M5GFX& disp) {
-  Scene current = scenes[State::sceneIndex];
+  if (haSceneCount == 0) return;
+  uint16_t accent = colorTo565(sceneColor(State::sceneIndex));
 
   // Brightness arc indicator (around the perimeter)
-  uint16_t brightColor = colorTo565(0xf2a93b);
-  drawBrightnessArc(disp, State::brightness, brightColor);
+  drawBrightnessArc(disp, State::brightness, colorTo565(0xf2a93b));
 
   // Scene icon (centered)
   disp.setTextSize(5);
-  disp.setTextColor(colorTo565(current.color), TFT_BLACK);
+  disp.setTextColor(accent, TFT_BLACK);
   disp.setTextDatum(middle_center);
   disp.drawString("*", 120, 70);  // Placeholder for icon
 
@@ -354,19 +370,13 @@ void displaySceneApplyMode(M5GFX& disp) {
   disp.setTextSize(2);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
   disp.setTextDatum(middle_center);
-  disp.drawString(current.name, 120, 135);
+  disp.drawString(sceneName(State::sceneIndex), 120, 135);
 
   // Applied indicator (centered)
   disp.setTextSize(1);
-  disp.setTextColor(colorTo565(current.color), TFT_BLACK);
+  disp.setTextColor(accent, TFT_BLACK);
   disp.setTextDatum(middle_center);
-  disp.drawString("Applied", 100, 175);
-
-  // Check mark
-  disp.setTextSize(2);
-  disp.setTextColor(colorTo565(current.color), TFT_BLACK);
-  disp.setTextDatum(middle_center);
-  disp.drawString("✓", 140, 175);
+  disp.drawString("Applied", 120, 175);
 }
 
 void drawBrightnessArc(M5GFX& disp, uint8_t brightness, uint16_t color) {

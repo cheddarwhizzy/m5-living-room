@@ -2,6 +2,7 @@
 #define HOME_ASSISTANT_H
 
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "WiFiConfig.h"
@@ -40,51 +41,51 @@ public:
     char name[64];
   };
 
-  // Strip area prefix from scene name (e.g., "Master Bedroom Mushroom" -> "Mushroom")
+  // "Master Bedroom Rest" -> "Rest"
   void stripAreaPrefix(const char* fullName, char* shortName, int maxLen) {
-    const char* ptr = fullName;
-    int spaceCount = 0;
-
-    // Skip words until we find the scene name (usually after 2+ spaces)
-    while (*ptr && spaceCount < 2) {
-      if (*ptr == ' ') {
-        spaceCount++;
-        ptr++;
-        // If next part looks like the scene name (capitalized), use it
-        if (spaceCount >= 2 && *ptr >= 'A' && *ptr <= 'Z') {
-          break;
-        }
-      } else {
-        ptr++;
-      }
+    const char* start = fullName;
+    size_t prefixLen = strlen(HA_NAME_PREFIX);
+    if (strncmp(fullName, HA_NAME_PREFIX, prefixLen) == 0 && fullName[prefixLen] != '\0') {
+      start = fullName + prefixLen;
     }
-
-    // If we found a scene name, copy it; otherwise use full name
-    if (spaceCount >= 2 && *ptr) {
-      strncpy(shortName, ptr, maxLen - 1);
-      shortName[maxLen - 1] = '\0';
-    } else {
-      strncpy(shortName, fullName, maxLen - 1);
-      shortName[maxLen - 1] = '\0';
-    }
+    strncpy(shortName, start, maxLen - 1);
+    shortName[maxLen - 1] = '\0';
   }
 
+  // Asks HA to render just the labelled scenes, so the ESP32 gets ~200 bytes
+  // instead of the ~200KB /api/states dump (which the WiFi stack truncates).
   bool fetchAreaScenes(Scene* scenes, int maxScenes, int& sceneCount) {
+    sceneCount = 0;
+
     if (!connected) {
       Serial.println("[HA] Not connected to WiFi");
       return false;
     }
 
     HTTPClient http;
-    String url = String(HA_URL) + "/api/states";
+    String url = String(HA_URL) + "/api/template";
 
     http.begin(url);
+    http.setConnectTimeout(5000);
+    http.setTimeout(10000);
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
     http.addHeader("Content-Type", "application/json");
 
-    int httpResponseCode = http.GET();
+    DynamicJsonDocument reqDoc(512);
+    reqDoc["template"] =
+      "[{% for e in label_entities('" HA_SCENE_LABEL "') %}"
+      "{\"id\":\"{{ e }}\",\"name\":\"{{ state_attr(e,'friendly_name') }}\"}"
+      "{{ ',' if not loop.last }}"
+      "{% endfor %}]";
+
+    String request;
+    serializeJson(reqDoc, request);
+
+    Serial.printf("[HA] Fetching scenes labelled '%s'\n", HA_SCENE_LABEL);
+    int httpResponseCode = http.POST(request);
+
     if (httpResponseCode != 200) {
-      Serial.printf("[HA] Failed to fetch states: %d\n", httpResponseCode);
+      Serial.printf("[HA] Template request failed: %d\n", httpResponseCode);
       http.end();
       return false;
     }
@@ -92,39 +93,35 @@ public:
     String payload = http.getString();
     http.end();
 
-    // Parse JSON to find scenes in the area
-    sceneCount = 0;
-    DynamicJsonDocument doc(16384);
-    DeserializationError error = deserializeJson(doc, payload);
+    Serial.printf("[HA] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
 
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
     if (error) {
       Serial.printf("[HA] JSON parse error: %s\n", error.c_str());
       return false;
     }
 
-    // Filter scenes by area
-    JsonArray arr = doc.as<JsonArray>();
-    for (JsonObject item : arr) {
-      if (sceneCount >= maxScenes) break;
-
-      const char* entityId = item["entity_id"];
-      if (entityId && strncmp(entityId, "scene.", 6) == 0) {
-        // Check if this scene is in our area
-        JsonObject attr = item["attributes"];
-        const char* areaId = attr["area_id"];
-
-        if (areaId && strcmp(areaId, HA_AREA) == 0) {
-          strncpy(scenes[sceneCount].entityId, entityId, 63);
-          const char* fullName = attr["friendly_name"] | "Unknown";
-          stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
-          sceneCount++;
-
-          Serial.printf("[HA] Found scene: %s (%s)\n", scenes[sceneCount-1].name, entityId);
-        }
+    for (JsonObject item : doc.as<JsonArray>()) {
+      if (sceneCount >= maxScenes) {
+        Serial.printf("[HA] Ignoring extra scenes beyond %d\n", maxScenes);
+        break;
       }
+
+      const char* entityId = item["id"];
+      const char* fullName = item["name"] | "Scene";
+      if (!entityId) continue;
+
+      strncpy(scenes[sceneCount].entityId, entityId, 63);
+      scenes[sceneCount].entityId[63] = '\0';
+      stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
+      sceneCount++;
+
+      Serial.printf("[HA] Added scene: %s (%s)\n", scenes[sceneCount - 1].name, entityId);
     }
 
-    return true;
+    Serial.printf("[HA] Total scenes found: %d\n", sceneCount);
+    return sceneCount > 0;
   }
 
   bool activateScene(const char* entityId) {
@@ -137,6 +134,8 @@ public:
     String url = String(HA_URL) + "/api/services/scene/turn_on";
 
     http.begin(url);
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
     http.addHeader("Content-Type", "application/json");
 
