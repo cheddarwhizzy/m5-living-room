@@ -20,8 +20,7 @@
 // UI Modes
 enum UIMode {
   MODE_BRIGHTNESS,
-  MODE_SCENE_SELECT,
-  MODE_SCENE_APPLY
+  MODE_SCENE_SELECT
 };
 
 // Home Assistant client
@@ -38,13 +37,22 @@ HAScene haScenes[8];
 int haSceneCount = 0;
 
 const unsigned long SCENE_REFRESH_MS = 30000;
-unsigned long lastSceneRefresh = 0;
 
 // Debounce HA calls so spinning the dial doesn't fire a request per detent
 const unsigned long COMMIT_DELAY_MS = 350;
 unsigned long scenePendingSince = 0;
 unsigned long brightnessPendingSince = 0;
 int lastActivatedScene = -1;
+
+// Every HA call does a full TLS handshake and blocks for ~1s, so all network
+// work runs on a separate task. The UI task only posts intent to these queues;
+// they hold one item and are overwritten, so a fast spin collapses to one call.
+QueueHandle_t sceneQueue;
+QueueHandle_t brightnessQueue;
+SemaphoreHandle_t sceneMutex;  // guards haScenes / haSceneCount across tasks
+
+#define SCENES_LOCK()   xSemaphoreTake(sceneMutex, portMAX_DELAY)
+#define SCENES_UNLOCK() xSemaphoreGive(sceneMutex)
 
 // Application State
 namespace State {
@@ -81,12 +89,11 @@ uint32_t sceneColor(int i) { return scenePalette[i % 8]; }
 // Forward declarations
 void updateDisplay();
 void refreshScenes();
+void haTask(void* param);
 void handleEncoder();
 void handleButton();
 void handleTouch();
 void enterSceneMode();
-void applyScene();
-void applyBrightness();
 void returnToBrightness();
 void displayBrightnessMode(M5GFX& disp);
 void displaySceneSelectMode(M5GFX& disp);
@@ -112,6 +119,10 @@ void setup() {
   M5Dial.Display.setTextDatum(middle_center);
   M5Dial.Display.drawString("Connecting...", 120, 120);
 
+  sceneMutex = xSemaphoreCreateMutex();
+  sceneQueue = xQueueCreate(1, sizeof(int));
+  brightnessQueue = xQueueCreate(1, sizeof(uint8_t));
+
   // Connect to WiFi and Home Assistant
   if (haClient.connectWiFi()) {
     M5Dial.Display.fillScreen(TFT_BLACK);
@@ -121,38 +132,81 @@ void setup() {
     Serial.println("[Setup] WiFi connection failed - no scenes available");
   }
 
+  // TLS needs a generous stack; pinned to core 0 to stay off the UI core.
+  xTaskCreatePinnedToCore(haTask, "ha", 12288, nullptr, 1, nullptr, 0);
+
   Serial.println("Hardware initialized - Phase 2 UI ready");
   State::needsRedraw = true;
   updateDisplay();
 }
 
 // Re-reads the labelled scene list so newly labelled scenes appear without a reboot.
+// Runs on the HA task; the fetch itself is unlocked, only the swap is guarded.
 void refreshScenes() {
-  lastSceneRefresh = millis();
-
-  static HomeAssistantClient::Scene fetched[8];  // static: too large for the loop task stack
+  static HomeAssistantClient::Scene fetched[8];  // static: too large for the task stack
   int fetchedCount = 0;
   if (!haClient.fetchAreaScenes(fetched, 8, fetchedCount)) return;
 
+  SCENES_LOCK();
   bool changed = (fetchedCount != haSceneCount);
   for (int i = 0; i < fetchedCount && !changed; i++) {
     changed = strcmp(haScenes[i].entityId, fetched[i].entityId) != 0 ||
-              strcmp(haScenes[i].name, fetched[i].name) != 0;
+              strcmp(haScenes[i].name, fetched[i].name) != 0 ||
+              strcmp(haScenes[i].lights, fetched[i].lights) != 0;
   }
-  if (!changed) return;
 
-  for (int i = 0; i < fetchedCount; i++) {
-    strcpy(haScenes[i].entityId, fetched[i].entityId);
-    strcpy(haScenes[i].name, fetched[i].name);
-    strcpy(haScenes[i].lights, fetched[i].lights);
+  if (changed) {
+    for (int i = 0; i < fetchedCount; i++) {
+      strcpy(haScenes[i].entityId, fetched[i].entityId);
+      strcpy(haScenes[i].name, fetched[i].name);
+      strcpy(haScenes[i].lights, fetched[i].lights);
+    }
+    haSceneCount = fetchedCount;
+    if (lastActivatedScene >= haSceneCount) lastActivatedScene = -1;
+    if (State::sceneIndex >= haSceneCount) State::sceneIndex = 0;
+    if (State::sceneShown >= haSceneCount) State::sceneShown = 0;
+    State::needsRedraw = true;
+    Serial.printf("[Scenes] Updated: %d scenes\n", haSceneCount);
   }
-  haSceneCount = fetchedCount;
-  if (lastActivatedScene >= haSceneCount) lastActivatedScene = -1;
+  SCENES_UNLOCK();
+}
 
-  if (State::sceneIndex >= haSceneCount) State::sceneIndex = 0;
-  if (State::sceneShown >= haSceneCount) State::sceneShown = 0;
-  State::needsRedraw = true;
-  Serial.printf("[Scenes] Updated: %d scenes\n", haSceneCount);
+// All blocking network work lives here so the UI task never stalls.
+void haTask(void* param) {
+  unsigned long lastRefresh = millis();
+
+  for (;;) {
+    int sceneIdx;
+    if (xQueueReceive(sceneQueue, &sceneIdx, 0) == pdTRUE) {
+      char entityId[64] = {0};
+      SCENES_LOCK();
+      if (sceneIdx >= 0 && sceneIdx < haSceneCount) strcpy(entityId, haScenes[sceneIdx].entityId);
+      SCENES_UNLOCK();
+
+      if (entityId[0] && haClient.activateScene(entityId)) {
+        lastActivatedScene = sceneIdx;
+        Serial.printf("[Scene] Live: %s\n", entityId);
+      }
+    }
+
+    uint8_t brightness;
+    if (xQueueReceive(brightnessQueue, &brightness, 0) == pdTRUE) {
+      int idx = (lastActivatedScene >= 0) ? lastActivatedScene : State::sceneIndex;
+      char lights[256] = {0};
+      SCENES_LOCK();
+      if (idx >= 0 && idx < haSceneCount) strcpy(lights, haScenes[idx].lights);
+      SCENES_UNLOCK();
+
+      if (lights[0]) haClient.setBrightness(lights, brightness);
+    }
+
+    if (millis() - lastRefresh > SCENE_REFRESH_MS) {
+      lastRefresh = millis();
+      refreshScenes();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 void loop() {
@@ -162,19 +216,17 @@ void loop() {
   handleButton();
   handleTouch();
 
-  // Pick up newly labelled scenes without a power cycle
-  if (millis() - lastSceneRefresh > SCENE_REFRESH_MS) {
-    refreshScenes();
-  }
-
-  // Commit pending changes to HA once the dial has settled
+  // Hand off to the HA task once the dial has settled. Queues are overwritten,
+  // so only the final position of a spin is sent.
   if (scenePendingSince && millis() - scenePendingSince > COMMIT_DELAY_MS) {
     scenePendingSince = 0;
-    applyScene();
+    int idx = State::sceneIndex;
+    xQueueOverwrite(sceneQueue, &idx);
   }
   if (brightnessPendingSince && millis() - brightnessPendingSince > COMMIT_DELAY_MS) {
     brightnessPendingSince = 0;
-    applyBrightness();
+    uint8_t b = State::brightness;
+    xQueueOverwrite(brightnessQueue, &b);
   }
 
   // Only redraw if state changed
@@ -265,26 +317,6 @@ void enterSceneMode() {
   Serial.println("[Mode] Switched to SCENE_SELECT");
 }
 
-// Activates the highlighted scene in HA. Called automatically once the dial settles.
-void applyScene() {
-  if (haSceneCount == 0 || State::sceneIndex >= haSceneCount) return;
-
-  if (haClient.activateScene(haScenes[State::sceneIndex].entityId)) {
-    lastActivatedScene = State::sceneIndex;
-    Serial.printf("[Scene] Live: %s\n", sceneName(State::sceneIndex));
-  }
-}
-
-// Applies the dial brightness to the lights belonging to the active scene.
-void applyBrightness() {
-  int idx = (lastActivatedScene >= 0 && lastActivatedScene < haSceneCount)
-              ? lastActivatedScene
-              : State::sceneIndex;
-  if (haSceneCount == 0 || idx >= haSceneCount) return;
-
-  haClient.setBrightness(haScenes[idx].lights, State::brightness);
-}
-
 void returnToBrightness() {
   State::mode = MODE_BRIGHTNESS;
   State::modeChangeTime = millis();
@@ -301,7 +333,9 @@ void updateDisplay() {
   if (State::mode == MODE_BRIGHTNESS) {
     displayBrightnessMode(disp);
   } else {
+    SCENES_LOCK();  // the HA task can swap the scene list mid-draw
     displaySceneSelectMode(disp);
+    SCENES_UNLOCK();
   }
 }
 
