@@ -31,6 +31,7 @@ HomeAssistantClient haClient;
 struct HAScene {
   char entityId[64];
   char name[64];
+  char lights[256];
 };
 
 HAScene haScenes[8];
@@ -38,6 +39,12 @@ int haSceneCount = 0;
 
 const unsigned long SCENE_REFRESH_MS = 30000;
 unsigned long lastSceneRefresh = 0;
+
+// Debounce HA calls so spinning the dial doesn't fire a request per detent
+const unsigned long COMMIT_DELAY_MS = 350;
+unsigned long scenePendingSince = 0;
+unsigned long brightnessPendingSince = 0;
+int lastActivatedScene = -1;
 
 // Application State
 namespace State {
@@ -79,10 +86,10 @@ void handleButton();
 void handleTouch();
 void enterSceneMode();
 void applyScene();
+void applyBrightness();
 void returnToBrightness();
 void displayBrightnessMode(M5GFX& disp);
 void displaySceneSelectMode(M5GFX& disp);
-void displaySceneApplyMode(M5GFX& disp);
 void drawBrightnessArc(M5GFX& disp, uint8_t brightness, uint16_t color);
 uint16_t colorTo565(uint32_t color);
 
@@ -123,7 +130,7 @@ void setup() {
 void refreshScenes() {
   lastSceneRefresh = millis();
 
-  HomeAssistantClient::Scene fetched[8];
+  static HomeAssistantClient::Scene fetched[8];  // static: too large for the loop task stack
   int fetchedCount = 0;
   if (!haClient.fetchAreaScenes(fetched, 8, fetchedCount)) return;
 
@@ -137,8 +144,10 @@ void refreshScenes() {
   for (int i = 0; i < fetchedCount; i++) {
     strcpy(haScenes[i].entityId, fetched[i].entityId);
     strcpy(haScenes[i].name, fetched[i].name);
+    strcpy(haScenes[i].lights, fetched[i].lights);
   }
   haSceneCount = fetchedCount;
+  if (lastActivatedScene >= haSceneCount) lastActivatedScene = -1;
 
   if (State::sceneIndex >= haSceneCount) State::sceneIndex = 0;
   if (State::sceneShown >= haSceneCount) State::sceneShown = 0;
@@ -158,9 +167,14 @@ void loop() {
     refreshScenes();
   }
 
-  // Check for mode transitions (scene apply timeout)
-  if (State::mode == MODE_SCENE_APPLY && (millis() - State::sceneApplyTime > 1000)) {
-    returnToBrightness();
+  // Commit pending changes to HA once the dial has settled
+  if (scenePendingSince && millis() - scenePendingSince > COMMIT_DELAY_MS) {
+    scenePendingSince = 0;
+    applyScene();
+  }
+  if (brightnessPendingSince && millis() - brightnessPendingSince > COMMIT_DELAY_MS) {
+    brightnessPendingSince = 0;
+    applyBrightness();
   }
 
   // Only redraw if state changed
@@ -190,6 +204,7 @@ void handleEncoder() {
       if (newBrightness != State::brightness) {
         State::brightness = newBrightness;
         State::needsRedraw = true;
+        brightnessPendingSince = millis();
         Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
       }
       State::encoderPosition = currentPos;
@@ -206,6 +221,7 @@ void handleEncoder() {
       State::sceneIndex = next;
       State::sceneShown = State::sceneIndex;
       State::needsRedraw = true;
+      scenePendingSince = millis();  // activates once the dial settles
       Serial.printf("[Encoder] Scene: %s (step delta: %d)\n", sceneName(State::sceneIndex), stepDelta);
       State::encoderPosition = currentPos;
     }
@@ -219,10 +235,8 @@ void handleButton() {
 
     if (State::mode == MODE_BRIGHTNESS) {
       enterSceneMode();
-    } else if (State::mode == MODE_SCENE_SELECT) {
-      applyScene();
-    } else if (State::mode == MODE_SCENE_APPLY) {
-      returnToBrightness();
+    } else {
+      returnToBrightness();  // scenes are already live; click just goes back
     }
   }
 }
@@ -251,23 +265,24 @@ void enterSceneMode() {
   Serial.println("[Mode] Switched to SCENE_SELECT");
 }
 
+// Activates the highlighted scene in HA. Called automatically once the dial settles.
 void applyScene() {
-  State::mode = MODE_SCENE_APPLY;
-  State::sceneApplyTime = millis();
-  State::needsRedraw = true;
-  Serial.printf("[Scene] Applied: %s\n", sceneName(State::sceneIndex));
+  if (haSceneCount == 0 || State::sceneIndex >= haSceneCount) return;
 
-  // Activate the corresponding Home Assistant scene
-  if (haSceneCount > 0 && State::sceneIndex < haSceneCount) {
-    if (haClient.activateScene(haScenes[State::sceneIndex].entityId)) {
-      Serial.printf("[Scene] Activated HA scene: %s\n", haScenes[State::sceneIndex].name);
-    }
+  if (haClient.activateScene(haScenes[State::sceneIndex].entityId)) {
+    lastActivatedScene = State::sceneIndex;
+    Serial.printf("[Scene] Live: %s\n", sceneName(State::sceneIndex));
   }
+}
 
-  // Auto-return to brightness after 1 second
-  if (millis() - State::sceneApplyTime > 1000) {
-    returnToBrightness();
-  }
+// Applies the dial brightness to the lights belonging to the active scene.
+void applyBrightness() {
+  int idx = (lastActivatedScene >= 0 && lastActivatedScene < haSceneCount)
+              ? lastActivatedScene
+              : State::sceneIndex;
+  if (haSceneCount == 0 || idx >= haSceneCount) return;
+
+  haClient.setBrightness(haScenes[idx].lights, State::brightness);
 }
 
 void returnToBrightness() {
@@ -285,10 +300,8 @@ void updateDisplay() {
 
   if (State::mode == MODE_BRIGHTNESS) {
     displayBrightnessMode(disp);
-  } else if (State::mode == MODE_SCENE_SELECT) {
+  } else {
     displaySceneSelectMode(disp);
-  } else if (State::mode == MODE_SCENE_APPLY) {
-    displaySceneApplyMode(disp);
   }
 }
 
@@ -351,32 +364,6 @@ void displaySceneSelectMode(M5GFX& disp) {
     uint16_t dotColor = (i == State::sceneIndex) ? accent : colorTo565(0x333333);
     disp.fillCircle(startX + (i * dotSpacing), dotY, 3, dotColor);
   }
-}
-
-void displaySceneApplyMode(M5GFX& disp) {
-  if (haSceneCount == 0) return;
-  uint16_t accent = colorTo565(sceneColor(State::sceneIndex));
-
-  // Brightness arc indicator (around the perimeter)
-  drawBrightnessArc(disp, State::brightness, colorTo565(0xf2a93b));
-
-  // Scene icon (centered)
-  disp.setTextSize(5);
-  disp.setTextColor(accent, TFT_BLACK);
-  disp.setTextDatum(middle_center);
-  disp.drawString("*", 120, 70);  // Placeholder for icon
-
-  // Scene name (centered)
-  disp.setTextSize(2);
-  disp.setTextColor(TFT_WHITE, TFT_BLACK);
-  disp.setTextDatum(middle_center);
-  disp.drawString(sceneName(State::sceneIndex), 120, 135);
-
-  // Applied indicator (centered)
-  disp.setTextSize(1);
-  disp.setTextColor(accent, TFT_BLACK);
-  disp.setTextDatum(middle_center);
-  disp.drawString("Applied", 120, 175);
 }
 
 void drawBrightnessArc(M5GFX& disp, uint8_t brightness, uint16_t color) {

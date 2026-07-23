@@ -39,6 +39,7 @@ public:
   struct Scene {
     char entityId[64];
     char name[64];
+    char lights[256];  // comma-separated light entity ids belonging to the scene
   };
 
   // "Master Bedroom Rest" -> "Rest"
@@ -71,10 +72,11 @@ public:
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
     http.addHeader("Content-Type", "application/json");
 
-    DynamicJsonDocument reqDoc(512);
+    DynamicJsonDocument reqDoc(1024);
     reqDoc["template"] =
       "[{% for e in label_entities('" HA_SCENE_LABEL "') %}"
-      "{\"id\":\"{{ e }}\",\"name\":\"{{ state_attr(e,'friendly_name') }}\"}"
+      "{\"id\":\"{{ e }}\",\"name\":\"{{ state_attr(e,'friendly_name') }}\","
+      "\"lights\":\"{{ state_attr(e,'entity_id') | select('match','light\\\\.') | join(',') }}\"}"
       "{{ ',' if not loop.last }}"
       "{% endfor %}]";
 
@@ -95,7 +97,7 @@ public:
 
     Serial.printf("[HA] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
 
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(8192);
     DeserializationError error = deserializeJson(doc, payload);
     if (error) {
       Serial.printf("[HA] JSON parse error: %s\n", error.c_str());
@@ -110,11 +112,14 @@ public:
 
       const char* entityId = item["id"];
       const char* fullName = item["name"] | "Scene";
+      const char* lights = item["lights"] | "";
       if (!entityId) continue;
 
       strncpy(scenes[sceneCount].entityId, entityId, 63);
       scenes[sceneCount].entityId[63] = '\0';
       stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
+      strncpy(scenes[sceneCount].lights, lights, 255);
+      scenes[sceneCount].lights[255] = '\0';
       sceneCount++;
 
       Serial.printf("[HA] Added scene: %s (%s)\n", scenes[sceneCount - 1].name, entityId);
@@ -122,6 +127,49 @@ public:
 
     Serial.printf("[HA] Total scenes found: %d\n", sceneCount);
     return sceneCount > 0;
+  }
+
+  // Sets brightness on a comma-separated list of light entity ids.
+  bool setBrightness(const char* lightList, uint8_t brightnessPct) {
+    if (!connected || !lightList || lightList[0] == '\0') return false;
+
+    HTTPClient http;
+    String url = String(HA_URL) + "/api/services/light/turn_on";
+
+    http.begin(url);
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    http.addHeader("Authorization", "Bearer " HA_TOKEN);
+    http.addHeader("Content-Type", "application/json");
+
+    DynamicJsonDocument doc(1024);
+    JsonArray targets = doc.createNestedArray("entity_id");
+
+    // Split the comma-separated list into individual entity ids
+    String list(lightList);
+    int start = 0;
+    while (start < list.length()) {
+      int comma = list.indexOf(',', start);
+      if (comma < 0) comma = list.length();
+      String one = list.substring(start, comma);
+      one.trim();
+      if (one.length()) targets.add(one);
+      start = comma + 1;
+    }
+    doc["brightness_pct"] = brightnessPct;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    int code = http.POST(payload);
+    http.end();
+
+    if (code == 200) {
+      Serial.printf("[HA] Brightness %d%% on %d lights\n", brightnessPct, targets.size());
+      return true;
+    }
+    Serial.printf("[HA] Brightness call failed: %d\n", code);
+    return false;
   }
 
   bool activateScene(const char* entityId) {
