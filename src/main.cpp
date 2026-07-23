@@ -127,36 +127,34 @@ void loop() {
 
 void handleEncoder() {
   long currentPos = M5Dial.Encoder.read();
+  long encoderDelta = currentPos - State::encoderPosition;
+
+  if (encoderDelta == 0) return;
 
   if (State::mode == MODE_BRIGHTNESS) {
     // Smooth brightness adjustment
-    int encoderDelta = currentPos - State::encoderPosition;
-    if (encoderDelta != 0) {
-      State::encoderPosition = currentPos;
-      int newBrightness = State::brightness + encoderDelta;
-      newBrightness = constrain(newBrightness, Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
+    int newBrightness = State::brightness + encoderDelta;
+    newBrightness = constrain(newBrightness, Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
 
-      if (newBrightness != State::brightness) {
-        State::brightness = newBrightness;
-        State::needsRedraw = true;
-        Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
-      }
+    if (newBrightness != State::brightness) {
+      State::brightness = newBrightness;
+      State::needsRedraw = true;
+      Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
     }
   } else if (State::mode == MODE_SCENE_SELECT) {
     // Smooth scene browsing - one scene per encoder tick
-    int encoderDelta = currentPos - State::encoderPosition;
     if (encoderDelta > 2) {
       State::sceneIndex = (State::sceneIndex + 1) % sceneCount;
       State::sceneShown = State::sceneIndex;
       State::needsRedraw = true;
-      State::encoderPosition = currentPos;
       Serial.printf("[Encoder] Scene: %s\n", scenes[State::sceneIndex].name);
+      State::encoderPosition = currentPos - (encoderDelta - 1);  // Reset to threshold
     } else if (encoderDelta < -2) {
       State::sceneIndex = (State::sceneIndex - 1 + sceneCount) % sceneCount;
       State::sceneShown = State::sceneIndex;
       State::needsRedraw = true;
-      State::encoderPosition = currentPos;
       Serial.printf("[Encoder] Scene: %s\n", scenes[State::sceneIndex].name);
+      State::encoderPosition = currentPos - (encoderDelta + 1);  // Reset to threshold
     }
   }
 }
@@ -219,12 +217,6 @@ void updateDisplay() {
   // Clear screen
   disp.fillScreen(TFT_BLACK);
 
-  // Always show title
-  disp.setTextSize(1);
-  disp.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  disp.setCursor(45, 15);
-  disp.printf("M5 DIAL");
-
   if (State::mode == MODE_BRIGHTNESS) {
     displayBrightnessMode(disp);
   } else if (State::mode == MODE_SCENE_SELECT) {
@@ -238,81 +230,88 @@ void displayBrightnessMode(M5GFX& disp) {
   // Label
   disp.setTextSize(1);
   disp.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  disp.setCursor(60, 65);
-  disp.printf("Brightness");
+  disp.setTextDatum(middle_center);
+  disp.drawString("Brightness", 120, 50);
 
-  // Large percentage
+  // Large percentage - centered
   disp.setTextSize(7);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
-  disp.setCursor(25, 105);
-  disp.printf("%3d%%", State::brightness);
+  disp.setTextDatum(middle_center);
+  char brightnessStr[10];
+  sprintf(brightnessStr, "%d%%", State::brightness);
+  disp.drawString(brightnessStr, 120, 110);
 
   // Arc indicator
   uint16_t color565 = colorTo565(0xf2a93b);
   drawBrightnessArc(disp, State::brightness, color565);
 
-  // Status dot
-  disp.fillCircle(120, 210, 4, colorTo565(0x4fd08a));
+  // Status dot - centered at bottom
+  disp.fillCircle(120, 215, 5, colorTo565(0x4fd08a));
 }
 
 void displaySceneSelectMode(M5GFX& disp) {
   Scene current = scenes[State::sceneIndex];
 
-  // Scene icon (using emoji/text representation)
+  // Scene icon (centered)
   disp.setTextSize(5);
   disp.setTextColor(colorTo565(current.color), TFT_BLACK);
-  disp.setCursor(55, 80);
-  disp.printf("*");  // Placeholder for icon
+  disp.setTextDatum(middle_center);
+  disp.drawString("*", 120, 75);  // Placeholder for icon
 
-  // Scene name
+  // Scene name (centered)
   disp.setTextSize(2);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
-  disp.setCursor(35, 150);
-  disp.printf(current.name);
+  disp.setTextDatum(middle_center);
+  disp.drawString(current.name, 120, 145);
 
-  // Position indicator
+  // Position indicator (centered)
   disp.setTextSize(1);
   disp.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  disp.setCursor(85, 180);
-  disp.printf("%d/%d", State::sceneIndex + 1, sceneCount);
+  disp.setTextDatum(middle_center);
+  char posStr[10];
+  sprintf(posStr, "%d/%d", State::sceneIndex + 1, sceneCount);
+  disp.drawString(posStr, 120, 175);
 
-  // Status dots (scene indicators)
-  int dotY = 205;
+  // Status dots (scene indicators) - centered at bottom
+  int dotY = 210;
   int dotSpacing = 18;
+  int dotsWidth = (sceneCount - 1) * dotSpacing;
+  int startX = 120 - (dotsWidth / 2);
+
   for (int i = 0; i < sceneCount; i++) {
     uint16_t dotColor = (i == State::sceneIndex)
       ? colorTo565(current.color)
       : colorTo565(0x333333);
-    disp.fillCircle(48 + (i * dotSpacing), dotY, 3, dotColor);
+    disp.fillCircle(startX + (i * dotSpacing), dotY, 3, dotColor);
   }
 }
 
 void displaySceneApplyMode(M5GFX& disp) {
   Scene current = scenes[State::sceneIndex];
 
-  // Scene icon (animated)
+  // Scene icon (centered)
   disp.setTextSize(5);
   disp.setTextColor(colorTo565(current.color), TFT_BLACK);
-  disp.setCursor(55, 70);
-  disp.printf("*");  // Placeholder for icon
+  disp.setTextDatum(middle_center);
+  disp.drawString("*", 120, 70);  // Placeholder for icon
 
-  // Scene name
+  // Scene name (centered)
   disp.setTextSize(2);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
-  disp.setCursor(35, 145);
-  disp.printf(current.name);
+  disp.setTextDatum(middle_center);
+  disp.drawString(current.name, 120, 135);
 
-  // Applied indicator
+  // Applied indicator (centered)
   disp.setTextSize(1);
   disp.setTextColor(colorTo565(current.color), TFT_BLACK);
-  disp.setCursor(85, 175);
-  disp.printf("Applied");
+  disp.setTextDatum(middle_center);
+  disp.drawString("Applied", 100, 175);
 
   // Check mark
   disp.setTextSize(2);
   disp.setTextColor(colorTo565(current.color), TFT_BLACK);
-  disp.setCursor(110, 175);
-  disp.printf("✓");
+  disp.setTextDatum(middle_center);
+  disp.drawString("✓", 140, 175);
 }
 
 void drawBrightnessArc(M5GFX& disp, uint8_t brightness, uint16_t color) {
