@@ -35,13 +35,12 @@ public:
     }
   }
 
-  struct Entity {
+  struct Scene {
     char entityId[64];
     char name[64];
-    char state[32];
   };
 
-  bool fetchAreaLights(Entity* lights, int maxLights, int& lightCount) {
+  bool fetchAreaScenes(Scene* scenes, int maxScenes, int& sceneCount) {
     if (!connected) {
       Serial.println("[HA] Not connected to WiFi");
       return false;
@@ -64,8 +63,8 @@ public:
     String payload = http.getString();
     http.end();
 
-    // Parse JSON to find lights in the area
-    lightCount = 0;
+    // Parse JSON to find scenes in the area
+    sceneCount = 0;
     DynamicJsonDocument doc(16384);
     DeserializationError error = deserializeJson(doc, payload);
 
@@ -74,24 +73,23 @@ public:
       return false;
     }
 
-    // Filter lights by area
+    // Filter scenes by area
     JsonArray arr = doc.as<JsonArray>();
     for (JsonObject item : arr) {
-      if (lightCount >= maxLights) break;
+      if (sceneCount >= maxScenes) break;
 
       const char* entityId = item["entity_id"];
-      if (entityId && strncmp(entityId, "light.", 6) == 0) {
-        // Check if this light is in our area
+      if (entityId && strncmp(entityId, "scene.", 6) == 0) {
+        // Check if this scene is in our area
         JsonObject attr = item["attributes"];
         const char* areaId = attr["area_id"];
 
         if (areaId && strcmp(areaId, HA_AREA) == 0) {
-          strncpy(lights[lightCount].entityId, entityId, 63);
-          strncpy(lights[lightCount].name, attr["friendly_name"] | "Unknown", 63);
-          strncpy(lights[lightCount].state, item["state"], 31);
-          lightCount++;
+          strncpy(scenes[sceneCount].entityId, entityId, 63);
+          strncpy(scenes[sceneCount].name, attr["friendly_name"] | "Unknown", 63);
+          sceneCount++;
 
-          Serial.printf("[HA] Found light: %s (%s)\n", lights[lightCount-1].name, entityId);
+          Serial.printf("[HA] Found scene: %s (%s)\n", scenes[sceneCount-1].name, entityId);
         }
       }
     }
@@ -99,14 +97,14 @@ public:
     return true;
   }
 
-  bool toggleLight(const char* entityId) {
+  bool activateScene(const char* entityId) {
     if (!connected) {
       Serial.println("[HA] Not connected to WiFi");
       return false;
     }
 
     HTTPClient http;
-    String url = String(HA_URL) + "/api/services/light/toggle";
+    String url = String(HA_URL) + "/api/services/scene/turn_on";
 
     http.begin(url);
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
@@ -122,42 +120,9 @@ public:
     bool success = (httpResponseCode == 200);
 
     if (success) {
-      Serial.printf("[HA] Toggled %s\n", entityId);
+      Serial.printf("[HA] Activated scene %s\n", entityId);
     } else {
-      Serial.printf("[HA] Failed to toggle %s: %d\n", entityId, httpResponseCode);
-    }
-
-    http.end();
-    return success;
-  }
-
-  bool setBrightness(const char* entityId, uint8_t brightness) {
-    if (!connected) {
-      Serial.println("[HA] Not connected to WiFi");
-      return false;
-    }
-
-    HTTPClient http;
-    String url = String(HA_URL) + "/api/services/light/turn_on";
-
-    http.begin(url);
-    http.addHeader("Authorization", "Bearer " HA_TOKEN);
-    http.addHeader("Content-Type", "application/json");
-
-    DynamicJsonDocument doc(256);
-    doc["entity_id"] = entityId;
-    doc["brightness"] = (int)(brightness * 2.55); // Convert 0-100 to 0-255
-
-    String payload;
-    serializeJson(doc, payload);
-
-    int httpResponseCode = http.POST(payload);
-    bool success = (httpResponseCode == 200);
-
-    if (success) {
-      Serial.printf("[HA] Set %s brightness to %d\n", entityId, brightness);
-    } else {
-      Serial.printf("[HA] Failed to set brightness: %d\n", httpResponseCode);
+      Serial.printf("[HA] Failed to activate scene %s: %d\n", entityId, httpResponseCode);
     }
 
     http.end();

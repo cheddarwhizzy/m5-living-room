@@ -34,15 +34,14 @@ struct Scene {
 // Home Assistant client
 HomeAssistantClient haClient;
 
-// HA Lights discovered
-struct Light {
+// HA Scenes discovered
+struct HAScene {
   char entityId[64];
   char name[64];
-  bool on = false;
 };
 
-Light haLights[8];
-int haLightCount = 0;
+HAScene haScenes[8];
+int haSceneCount = 0;
 
 // Application State
 namespace State {
@@ -116,19 +115,18 @@ void setup() {
   // Connect to WiFi and Home Assistant
   if (haClient.connectWiFi()) {
     M5Dial.Display.fillScreen(TFT_BLACK);
-    M5Dial.Display.drawString("Fetching lights...", 120, 120);
+    M5Dial.Display.drawString("Fetching scenes...", 120, 120);
 
-    // Fetch lights from Home Assistant
-    HomeAssistantClient::Entity entities[8];
-    if (haClient.fetchAreaLights(entities, 8, haLightCount)) {
-      for (int i = 0; i < haLightCount; i++) {
-        strcpy(haLights[i].entityId, entities[i].entityId);
-        strcpy(haLights[i].name, entities[i].name);
-        haLights[i].on = (strcmp(entities[i].state, "on") == 0);
+    // Fetch scenes from Home Assistant
+    HomeAssistantClient::Scene haScenesData[8];
+    if (haClient.fetchAreaScenes(haScenesData, 8, haSceneCount)) {
+      for (int i = 0; i < haSceneCount; i++) {
+        strcpy(haScenes[i].entityId, haScenesData[i].entityId);
+        strcpy(haScenes[i].name, haScenesData[i].name);
       }
-      Serial.printf("[Setup] Found %d lights\n", haLightCount);
+      Serial.printf("[Setup] Found %d scenes\n", haSceneCount);
     } else {
-      Serial.println("[Setup] Failed to fetch lights");
+      Serial.println("[Setup] Failed to fetch scenes");
     }
   } else {
     Serial.println("[Setup] WiFi connection failed");
@@ -240,11 +238,10 @@ void applyScene() {
   State::needsRedraw = true;
   Serial.printf("[Scene] Applied: %s\n", scenes[State::sceneIndex].name);
 
-  // Control lights based on scene
-  if (haLightCount > 0) {
-    // For now, set brightness on first light based on current brightness
-    if (haClient.setBrightness(haLights[0].entityId, State::brightness)) {
-      Serial.printf("[Scene] Controlled %s\n", haLights[0].name);
+  // Activate the corresponding Home Assistant scene
+  if (haSceneCount > 0 && State::sceneIndex < haSceneCount) {
+    if (haClient.activateScene(haScenes[State::sceneIndex].entityId)) {
+      Serial.printf("[Scene] Activated HA scene: %s\n", haScenes[State::sceneIndex].name);
     }
   }
 
