@@ -36,10 +36,14 @@ public:
     }
   }
 
+  // Scenes built from individual lights rather than groups list many more
+  // entities, so this is sized for a room's worth of them.
+  static const int LIGHTS_LEN = 768;
+
   struct Scene {
     char entityId[64];
     char name[64];
-    char lights[256];  // comma-separated light entity ids belonging to the scene
+    char lights[LIGHTS_LEN];  // comma-separated light entity ids in the scene
   };
 
   // "Master Bedroom Rest" -> "Rest"
@@ -97,7 +101,7 @@ public:
 
     Serial.printf("[HA] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
 
-    DynamicJsonDocument doc(8192);
+    DynamicJsonDocument doc(16384);
     DeserializationError error = deserializeJson(doc, payload);
     if (error) {
       Serial.printf("[HA] JSON parse error: %s\n", error.c_str());
@@ -118,8 +122,11 @@ public:
       strncpy(scenes[sceneCount].entityId, entityId, 63);
       scenes[sceneCount].entityId[63] = '\0';
       stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
-      strncpy(scenes[sceneCount].lights, lights, 255);
-      scenes[sceneCount].lights[255] = '\0';
+      strncpy(scenes[sceneCount].lights, lights, LIGHTS_LEN - 1);
+      scenes[sceneCount].lights[LIGHTS_LEN - 1] = '\0';
+      if (strlen(lights) >= LIGHTS_LEN) {
+        Serial.printf("[HA] WARNING: light list truncated for %s\n", entityId);
+      }
       sceneCount++;
 
       Serial.printf("[HA] Added scene: %s (%s)\n", scenes[sceneCount - 1].name, entityId);
@@ -142,7 +149,7 @@ public:
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
     http.addHeader("Content-Type", "application/json");
 
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(2048);
     JsonArray targets = doc.createNestedArray("entity_id");
 
     // Split the comma-separated list into individual entity ids

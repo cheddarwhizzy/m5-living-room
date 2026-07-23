@@ -30,7 +30,7 @@ HomeAssistantClient haClient;
 struct HAScene {
   char entityId[64];
   char name[64];
-  char lights[256];
+  char lights[HomeAssistantClient::LIGHTS_LEN];
 };
 
 HAScene haScenes[8];
@@ -38,11 +38,12 @@ int haSceneCount = 0;
 
 const unsigned long SCENE_REFRESH_MS = 30000;
 
-// Brightness change per physical detent
+// Brightness change per encoder count
 const int BRIGHTNESS_STEP = 2;
 
-// Debounce HA calls so spinning the dial doesn't fire a request per detent
-const unsigned long COMMIT_DELAY_MS = 350;
+// How long the dial must sit still before a change is sent to HA. Long enough
+// that scrolling past scenes doesn't activate each one on the way.
+const unsigned long COMMIT_DELAY_MS = 600;
 unsigned long scenePendingSince = 0;
 unsigned long brightnessPendingSince = 0;
 int lastActivatedScene = -1;
@@ -73,7 +74,8 @@ namespace State {
   bool showingFeedback = false;
 
   // Encoder
-  long encoderPosition = 0;
+  long encoderPosition = 0;  // raw counts (brightness)
+  long encoderDetent = 0;    // whole detents (scene selection)
   long lastDisplayedEncoder = 0;
   float encoderAccel = 1.0f;
   unsigned long lastEncoderTime = 0;
@@ -182,21 +184,29 @@ void haTask(void* param) {
   for (;;) {
     int sceneIdx;
     if (xQueueReceive(sceneQueue, &sceneIdx, 0) == pdTRUE) {
-      char entityId[64] = {0};
-      SCENES_LOCK();
-      if (sceneIdx >= 0 && sceneIdx < haSceneCount) strcpy(entityId, haScenes[sceneIdx].entityId);
-      SCENES_UNLOCK();
+      // A request queued behind a slow call may already be stale - the user has
+      // kept turning. Only act if this is still what the dial is showing.
+      if (sceneIdx != State::sceneIndex) {
+        Serial.printf("[Scene] Skipping stale scene %d (now %d)\n", sceneIdx, State::sceneIndex);
+      } else {
+        char entityId[64] = {0};
+        SCENES_LOCK();
+        if (sceneIdx >= 0 && sceneIdx < haSceneCount) strcpy(entityId, haScenes[sceneIdx].entityId);
+        SCENES_UNLOCK();
 
-      if (entityId[0] && haClient.activateScene(entityId)) {
-        lastActivatedScene = sceneIdx;
-        Serial.printf("[Scene] Live: %s\n", entityId);
+        if (entityId[0] && haClient.activateScene(entityId)) {
+          lastActivatedScene = sceneIdx;
+          Serial.printf("[Scene] Live: %s\n", entityId);
+        }
       }
     }
 
     uint8_t brightness;
     if (xQueueReceive(brightnessQueue, &brightness, 0) == pdTRUE) {
+      brightness = State::brightness;  // always send the dial's current value
       int idx = (lastActivatedScene >= 0) ? lastActivatedScene : State::sceneIndex;
-      char lights[256] = {0};
+      static char lights[HomeAssistantClient::LIGHTS_LEN];  // static: keeps the task stack small
+      lights[0] = '\0';
       SCENES_LOCK();
       if (idx >= 0 && idx < haSceneCount) strcpy(lights, haScenes[idx].lights);
       SCENES_UNLOCK();
@@ -247,26 +257,29 @@ void loop() {
   delay(10);
 }
 
-// The encoder reports 4 counts per physical detent. Plain division truncates
-// toward zero, which makes steps around 0 asymmetric, so floor explicitly.
-long encoderDetents() {
-  long raw = M5Dial.Encoder.read();
+// Scene selection steps once per physical detent (4 encoder counts). Plain
+// division truncates toward zero, which makes steps around 0 asymmetric.
+long toDetents(long raw) {
   return (raw >= 0) ? (raw / 4) : -((-raw + 3) / 4);
 }
 
 // Discards any accumulated motion so a mode change never applies a stale delta.
 void resyncEncoder() {
-  State::encoderPosition = encoderDetents();
+  long raw = M5Dial.Encoder.read();
+  State::encoderPosition = raw;
+  State::encoderDetent = toDetents(raw);
 }
 
 void handleEncoder() {
-  long detents = encoderDetents();
-  int delta = (int)(detents - State::encoderPosition);
-  if (delta == 0) return;
-
-  State::encoderPosition = detents;
+  long raw = M5Dial.Encoder.read();
 
   if (State::mode == MODE_BRIGHTNESS) {
+    // Brightness tracks raw counts - one step per count, so a small turn moves it.
+    int delta = (int)(raw - State::encoderPosition);
+    if (delta == 0) return;
+    State::encoderPosition = raw;
+    State::encoderDetent = toDetents(raw);
+
     int newBrightness = constrain(State::brightness + delta * BRIGHTNESS_STEP,
                                   Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
     if (newBrightness != State::brightness) {
@@ -276,6 +289,13 @@ void handleEncoder() {
       Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
     }
   } else if (State::mode == MODE_SCENE_SELECT && haSceneCount > 0) {
+    // Scenes step per detent so one click never skips past a scene.
+    long detents = toDetents(raw);
+    int delta = (int)(detents - State::encoderDetent);
+    if (delta == 0) return;
+    State::encoderDetent = detents;
+    State::encoderPosition = raw;
+
     int next = ((int)State::sceneIndex + delta) % haSceneCount;
     if (next < 0) next += haSceneCount;
     State::sceneIndex = next;
