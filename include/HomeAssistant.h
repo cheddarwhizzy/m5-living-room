@@ -132,6 +132,18 @@ public:
       Serial.printf("[HA] Added scene: %s (%s)\n", scenes[sceneCount - 1].name, entityId);
     }
 
+    // label_entities() has no defined order, so sort by name to keep the dial's
+    // scene positions stable across refreshes.
+    for (int i = 1; i < sceneCount; i++) {
+      Scene key = scenes[i];
+      int j = i - 1;
+      while (j >= 0 && strcasecmp(scenes[j].name, key.name) > 0) {
+        scenes[j + 1] = scenes[j];
+        j--;
+      }
+      scenes[j + 1] = key;
+    }
+
     Serial.printf("[HA] Total scenes found: %d\n", sceneCount);
     return sceneCount > 0;
   }
@@ -144,8 +156,8 @@ public:
     String url = String(HA_URL) + "/api/services/light/turn_on";
 
     http.begin(url);
-    http.setConnectTimeout(5000);
-    http.setTimeout(5000);
+    http.setConnectTimeout(8000);
+    http.setTimeout(12000);
     http.addHeader("Authorization", "Bearer " HA_TOKEN);
     http.addHeader("Content-Type", "application/json");
 
@@ -179,38 +191,38 @@ public:
     return false;
   }
 
+  // Each call sets up a fresh TLS connection, which occasionally overruns the
+  // timeout (-11 READ_TIMEOUT), so a failed attempt is retried once.
   bool activateScene(const char* entityId) {
     if (!connected) {
       Serial.println("[HA] Not connected to WiFi");
       return false;
     }
 
-    HTTPClient http;
-    String url = String(HA_URL) + "/api/services/scene/turn_on";
-
-    http.begin(url);
-    http.setConnectTimeout(5000);
-    http.setTimeout(5000);
-    http.addHeader("Authorization", "Bearer " HA_TOKEN);
-    http.addHeader("Content-Type", "application/json");
-
     DynamicJsonDocument doc(256);
     doc["entity_id"] = entityId;
-
     String payload;
     serializeJson(doc, payload);
 
-    int httpResponseCode = http.POST(payload);
-    bool success = (httpResponseCode == 200);
+    for (int attempt = 1; attempt <= 2; attempt++) {
+      HTTPClient http;
+      http.begin(String(HA_URL) + "/api/services/scene/turn_on");
+      http.setConnectTimeout(8000);
+      http.setTimeout(12000);
+      http.addHeader("Authorization", "Bearer " HA_TOKEN);
+      http.addHeader("Content-Type", "application/json");
 
-    if (success) {
-      Serial.printf("[HA] Activated scene %s\n", entityId);
-    } else {
-      Serial.printf("[HA] Failed to activate scene %s: %d\n", entityId, httpResponseCode);
+      int code = http.POST(payload);
+      http.end();
+
+      if (code == 200) {
+        Serial.printf("[HA] Activated scene %s\n", entityId);
+        return true;
+      }
+      Serial.printf("[HA] Activate %s failed (attempt %d): %d\n", entityId, attempt, code);
+      if (attempt == 1) delay(150);
     }
-
-    http.end();
-    return success;
+    return false;
   }
 };
 

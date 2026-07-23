@@ -51,6 +51,12 @@ int lastActivatedScene = -1;
 // Every HA call does a full TLS handshake and blocks for ~1s, so all network
 // work runs on a separate task. The UI task only posts intent to these queues;
 // they hold one item and are overwritten, so a fast spin collapses to one call.
+// Scene commands carry the entity id, not an index: the list can be re-sorted
+// by a refresh between queueing and sending, which would activate the wrong one.
+struct SceneCommand {
+  char entityId[64];
+};
+
 QueueHandle_t sceneQueue;
 QueueHandle_t brightnessQueue;
 SemaphoreHandle_t sceneMutex;  // guards haScenes / haSceneCount across tasks
@@ -126,7 +132,7 @@ void setup() {
   M5Dial.Display.drawString("Connecting...", 120, 120);
 
   sceneMutex = xSemaphoreCreateMutex();
-  sceneQueue = xQueueCreate(1, sizeof(int));
+  sceneQueue = xQueueCreate(1, sizeof(SceneCommand));
   brightnessQueue = xQueueCreate(1, sizeof(uint8_t));
 
   // Connect to WiFi and Home Assistant
@@ -182,22 +188,24 @@ void haTask(void* param) {
   unsigned long lastRefresh = millis();
 
   for (;;) {
-    int sceneIdx;
-    if (xQueueReceive(sceneQueue, &sceneIdx, 0) == pdTRUE) {
+    SceneCommand cmd;
+    if (xQueueReceive(sceneQueue, &cmd, 0) == pdTRUE) {
       // A request queued behind a slow call may already be stale - the user has
-      // kept turning. Only act if this is still what the dial is showing.
-      if (sceneIdx != State::sceneIndex) {
-        Serial.printf("[Scene] Skipping stale scene %d (now %d)\n", sceneIdx, State::sceneIndex);
-      } else {
-        char entityId[64] = {0};
-        SCENES_LOCK();
-        if (sceneIdx >= 0 && sceneIdx < haSceneCount) strcpy(entityId, haScenes[sceneIdx].entityId);
-        SCENES_UNLOCK();
+      // kept turning. Compare against what the dial is showing right now.
+      char selected[64] = {0};
+      int selectedIdx = -1;
+      SCENES_LOCK();
+      if (State::sceneIndex < haSceneCount) {
+        strcpy(selected, haScenes[State::sceneIndex].entityId);
+        selectedIdx = State::sceneIndex;
+      }
+      SCENES_UNLOCK();
 
-        if (entityId[0] && haClient.activateScene(entityId)) {
-          lastActivatedScene = sceneIdx;
-          Serial.printf("[Scene] Live: %s\n", entityId);
-        }
+      if (strcmp(cmd.entityId, selected) != 0) {
+        Serial.printf("[Scene] Skipping stale %s (now %s)\n", cmd.entityId, selected);
+      } else if (haClient.activateScene(cmd.entityId)) {
+        lastActivatedScene = selectedIdx;
+        Serial.printf("[Scene] Live: %s\n", cmd.entityId);
       }
     }
 
@@ -234,8 +242,11 @@ void loop() {
   // so only the final position of a spin is sent.
   if (scenePendingSince && millis() - scenePendingSince > COMMIT_DELAY_MS) {
     scenePendingSince = 0;
-    int idx = State::sceneIndex;
-    xQueueOverwrite(sceneQueue, &idx);
+    SceneCommand cmd = {};
+    SCENES_LOCK();
+    if (State::sceneIndex < haSceneCount) strcpy(cmd.entityId, haScenes[State::sceneIndex].entityId);
+    SCENES_UNLOCK();
+    if (cmd.entityId[0]) xQueueOverwrite(sceneQueue, &cmd);
   }
   if (brightnessPendingSince && millis() - brightnessPendingSince > COMMIT_DELAY_MS) {
     brightnessPendingSince = 0;
