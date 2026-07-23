@@ -38,6 +38,9 @@ int haSceneCount = 0;
 
 const unsigned long SCENE_REFRESH_MS = 30000;
 
+// Brightness change per physical detent
+const int BRIGHTNESS_STEP = 2;
+
 // Debounce HA calls so spinning the dial doesn't fire a request per detent
 const unsigned long COMMIT_DELAY_MS = 350;
 unsigned long scenePendingSince = 0;
@@ -90,6 +93,7 @@ uint32_t sceneColor(int i) { return scenePalette[i % 8]; }
 void updateDisplay();
 void refreshScenes();
 void haTask(void* param);
+void resyncEncoder();
 void handleEncoder();
 void handleButton();
 void handleTouch();
@@ -243,40 +247,42 @@ void loop() {
   delay(10);
 }
 
+// The encoder reports 4 counts per physical detent. Plain division truncates
+// toward zero, which makes steps around 0 asymmetric, so floor explicitly.
+long encoderDetents() {
+  long raw = M5Dial.Encoder.read();
+  return (raw >= 0) ? (raw / 4) : -((-raw + 3) / 4);
+}
+
+// Discards any accumulated motion so a mode change never applies a stale delta.
+void resyncEncoder() {
+  State::encoderPosition = encoderDetents();
+}
+
 void handleEncoder() {
-  long currentPos = M5Dial.Encoder.read();
+  long detents = encoderDetents();
+  int delta = (int)(detents - State::encoderPosition);
+  if (delta == 0) return;
+
+  State::encoderPosition = detents;
 
   if (State::mode == MODE_BRIGHTNESS) {
-    // Smooth brightness adjustment
-    int encoderDelta = currentPos - State::encoderPosition;
-    if (encoderDelta != 0) {
-      int newBrightness = State::brightness + encoderDelta;
-      newBrightness = constrain(newBrightness, Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
-
-      if (newBrightness != State::brightness) {
-        State::brightness = newBrightness;
-        State::needsRedraw = true;
-        brightnessPendingSince = millis();
-        Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
-      }
-      State::encoderPosition = currentPos;
+    int newBrightness = constrain(State::brightness + delta * BRIGHTNESS_STEP,
+                                  Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
+    if (newBrightness != State::brightness) {
+      State::brightness = newBrightness;
+      State::needsRedraw = true;
+      brightnessPendingSince = millis();
+      Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
     }
   } else if (State::mode == MODE_SCENE_SELECT && haSceneCount > 0) {
-    // One scene per detent click (divide by 4 for discrete steps)
-    int selectorValue = currentPos / 4;
-    int lastSelectorValue = State::encoderPosition / 4;
-
-    if (selectorValue != lastSelectorValue) {
-      int stepDelta = selectorValue - lastSelectorValue;
-      int next = ((int)State::sceneIndex + stepDelta) % haSceneCount;
-      if (next < 0) next += haSceneCount;
-      State::sceneIndex = next;
-      State::sceneShown = State::sceneIndex;
-      State::needsRedraw = true;
-      scenePendingSince = millis();  // activates once the dial settles
-      Serial.printf("[Encoder] Scene: %s (step delta: %d)\n", sceneName(State::sceneIndex), stepDelta);
-      State::encoderPosition = currentPos;
-    }
+    int next = ((int)State::sceneIndex + delta) % haSceneCount;
+    if (next < 0) next += haSceneCount;
+    State::sceneIndex = next;
+    State::sceneShown = State::sceneIndex;
+    State::needsRedraw = true;
+    scenePendingSince = millis();  // activates once the dial settles
+    Serial.printf("[Encoder] Scene: %s (delta: %d)\n", sceneName(State::sceneIndex), delta);
   }
 }
 
@@ -313,6 +319,7 @@ void enterSceneMode() {
   State::mode = MODE_SCENE_SELECT;
   State::modeChangeTime = millis();
   State::sceneIndex = State::sceneShown;
+  resyncEncoder();
   State::needsRedraw = true;
   Serial.println("[Mode] Switched to SCENE_SELECT");
 }
@@ -320,6 +327,7 @@ void enterSceneMode() {
 void returnToBrightness() {
   State::mode = MODE_BRIGHTNESS;
   State::modeChangeTime = millis();
+  resyncEncoder();
   State::needsRedraw = true;
   Serial.println("[Mode] Switched to BRIGHTNESS");
 }
