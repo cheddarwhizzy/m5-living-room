@@ -40,6 +40,35 @@ public:
     char name[64];
   };
 
+  // Strip area prefix from scene name (e.g., "Master Bedroom Mushroom" -> "Mushroom")
+  void stripAreaPrefix(const char* fullName, char* shortName, int maxLen) {
+    const char* ptr = fullName;
+    int spaceCount = 0;
+
+    // Skip words until we find the scene name (usually after 2+ spaces)
+    while (*ptr && spaceCount < 2) {
+      if (*ptr == ' ') {
+        spaceCount++;
+        ptr++;
+        // If next part looks like the scene name (capitalized), use it
+        if (spaceCount >= 2 && *ptr >= 'A' && *ptr <= 'Z') {
+          break;
+        }
+      } else {
+        ptr++;
+      }
+    }
+
+    // If we found a scene name, copy it; otherwise use full name
+    if (spaceCount >= 2 && *ptr) {
+      strncpy(shortName, ptr, maxLen - 1);
+      shortName[maxLen - 1] = '\0';
+    } else {
+      strncpy(shortName, fullName, maxLen - 1);
+      shortName[maxLen - 1] = '\0';
+    }
+  }
+
   bool fetchAreaScenes(Scene* scenes, int maxScenes, int& sceneCount) {
     if (!connected) {
       Serial.println("[HA] Not connected to WiFi");
@@ -86,7 +115,8 @@ public:
 
         if (areaId && strcmp(areaId, HA_AREA) == 0) {
           strncpy(scenes[sceneCount].entityId, entityId, 63);
-          strncpy(scenes[sceneCount].name, attr["friendly_name"] | "Unknown", 63);
+          const char* fullName = attr["friendly_name"] | "Unknown";
+          stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
           sceneCount++;
 
           Serial.printf("[HA] Found scene: %s (%s)\n", scenes[sceneCount-1].name, entityId);
