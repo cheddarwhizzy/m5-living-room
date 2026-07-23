@@ -11,8 +11,11 @@
  */
 
 #include <M5Dial.h>
+#include <WiFi.h>
 #include "../include/AppConfig.h"
 #include "../include/BuildInfo.h"
+#include "../include/WiFiConfig.h"
+#include "../include/HomeAssistant.h"
 
 // UI Modes
 enum UIMode {
@@ -27,6 +30,19 @@ struct Scene {
   const char* icon;
   uint32_t color;
 };
+
+// Home Assistant client
+HomeAssistantClient haClient;
+
+// HA Lights discovered
+struct Light {
+  char entityId[64];
+  char name[64];
+  bool on = false;
+};
+
+Light haLights[8];
+int haLightCount = 0;
 
 // Application State
 namespace State {
@@ -82,7 +98,7 @@ void setup() {
   Serial.begin(Config::SERIAL_BAUD);
   delay(100);
 
-  Serial.println("\n=== M5 Dial Lighting Controller (Phase 2) ===");
+  Serial.println("\n=== M5 Dial Lighting Controller (Phase 2 + HA) ===");
   Serial.print("Firmware: ");
   Serial.println(BuildInfo::FIRMWARE_NAME);
   Serial.print("Version: ");
@@ -94,8 +110,32 @@ void setup() {
   M5Dial.Display.setTextSize(1);
   M5Dial.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5Dial.Display.fillScreen(TFT_BLACK);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("Connecting...", 120, 120);
+
+  // Connect to WiFi and Home Assistant
+  if (haClient.connectWiFi()) {
+    M5Dial.Display.fillScreen(TFT_BLACK);
+    M5Dial.Display.drawString("Fetching lights...", 120, 120);
+
+    // Fetch lights from Home Assistant
+    HomeAssistantClient::Entity entities[8];
+    if (haClient.fetchAreaLights(entities, 8, haLightCount)) {
+      for (int i = 0; i < haLightCount; i++) {
+        strcpy(haLights[i].entityId, entities[i].entityId);
+        strcpy(haLights[i].name, entities[i].name);
+        haLights[i].on = (strcmp(entities[i].state, "on") == 0);
+      }
+      Serial.printf("[Setup] Found %d lights\n", haLightCount);
+    } else {
+      Serial.println("[Setup] Failed to fetch lights");
+    }
+  } else {
+    Serial.println("[Setup] WiFi connection failed");
+  }
 
   Serial.println("Hardware initialized - Phase 2 UI ready");
+  State::needsRedraw = true;
   updateDisplay();
 }
 
@@ -127,34 +167,34 @@ void loop() {
 
 void handleEncoder() {
   long currentPos = M5Dial.Encoder.read();
-  long encoderDelta = currentPos - State::encoderPosition;
-
-  if (encoderDelta == 0) return;
 
   if (State::mode == MODE_BRIGHTNESS) {
     // Smooth brightness adjustment
-    int newBrightness = State::brightness + encoderDelta;
-    newBrightness = constrain(newBrightness, Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
+    int encoderDelta = currentPos - State::encoderPosition;
+    if (encoderDelta != 0) {
+      int newBrightness = State::brightness + encoderDelta;
+      newBrightness = constrain(newBrightness, Config::BRIGHTNESS_MIN, Config::BRIGHTNESS_MAX);
 
-    if (newBrightness != State::brightness) {
-      State::brightness = newBrightness;
-      State::needsRedraw = true;
-      Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
+      if (newBrightness != State::brightness) {
+        State::brightness = newBrightness;
+        State::needsRedraw = true;
+        Serial.printf("[Encoder] Brightness: %d%%\n", State::brightness);
+      }
+      State::encoderPosition = currentPos;
     }
   } else if (State::mode == MODE_SCENE_SELECT) {
-    // Smooth scene browsing - one scene per encoder tick
-    if (encoderDelta > 2) {
-      State::sceneIndex = (State::sceneIndex + 1) % sceneCount;
+    // One scene per detent click (divide by 4 for discrete steps)
+    int selectorValue = currentPos / 4;
+    int lastSelectorValue = State::encoderPosition / 4;
+
+    if (selectorValue != lastSelectorValue) {
+      // Calculate how many steps changed
+      int stepDelta = selectorValue - lastSelectorValue;
+      State::sceneIndex = (State::sceneIndex + stepDelta + (sceneCount * 10)) % sceneCount;
       State::sceneShown = State::sceneIndex;
       State::needsRedraw = true;
-      Serial.printf("[Encoder] Scene: %s\n", scenes[State::sceneIndex].name);
-      State::encoderPosition = currentPos - (encoderDelta - 1);  // Reset to threshold
-    } else if (encoderDelta < -2) {
-      State::sceneIndex = (State::sceneIndex - 1 + sceneCount) % sceneCount;
-      State::sceneShown = State::sceneIndex;
-      State::needsRedraw = true;
-      Serial.printf("[Encoder] Scene: %s\n", scenes[State::sceneIndex].name);
-      State::encoderPosition = currentPos - (encoderDelta + 1);  // Reset to threshold
+      Serial.printf("[Encoder] Scene: %s (step delta: %d)\n", scenes[State::sceneIndex].name, stepDelta);
+      State::encoderPosition = currentPos;
     }
   }
 }
@@ -164,8 +204,10 @@ void handleButton() {
     Serial.printf("[Button] Pressed\n");
     State::needsRedraw = true;
 
-    if (State::mode == MODE_BRIGHTNESS || State::mode == MODE_SCENE_SELECT) {
+    if (State::mode == MODE_BRIGHTNESS) {
       enterSceneMode();
+    } else if (State::mode == MODE_SCENE_SELECT) {
+      applyScene();
     } else if (State::mode == MODE_SCENE_APPLY) {
       returnToBrightness();
     }
@@ -197,6 +239,14 @@ void applyScene() {
   State::sceneApplyTime = millis();
   State::needsRedraw = true;
   Serial.printf("[Scene] Applied: %s\n", scenes[State::sceneIndex].name);
+
+  // Control lights based on scene
+  if (haLightCount > 0) {
+    // For now, set brightness on first light based on current brightness
+    if (haClient.setBrightness(haLights[0].entityId, State::brightness)) {
+      Serial.printf("[Scene] Controlled %s\n", haLights[0].name);
+    }
+  }
 
   // Auto-return to brightness after 1 second
   if (millis() - State::sceneApplyTime > 1000) {
@@ -233,12 +283,12 @@ void displayBrightnessMode(M5GFX& disp) {
   disp.setTextDatum(middle_center);
   disp.drawString("Brightness", 120, 50);
 
-  // Large percentage - centered
+  // Large number - centered
   disp.setTextSize(7);
   disp.setTextColor(TFT_WHITE, TFT_BLACK);
   disp.setTextDatum(middle_center);
   char brightnessStr[10];
-  sprintf(brightnessStr, "%d%%", State::brightness);
+  sprintf(brightnessStr, "%d", State::brightness);
   disp.drawString(brightnessStr, 120, 110);
 
   // Arc indicator
@@ -251,6 +301,10 @@ void displayBrightnessMode(M5GFX& disp) {
 
 void displaySceneSelectMode(M5GFX& disp) {
   Scene current = scenes[State::sceneIndex];
+
+  // Brightness arc indicator (around the perimeter)
+  uint16_t brightColor = colorTo565(0xf2a93b);
+  drawBrightnessArc(disp, State::brightness, brightColor);
 
   // Scene icon (centered)
   disp.setTextSize(5);
@@ -289,6 +343,10 @@ void displaySceneSelectMode(M5GFX& disp) {
 void displaySceneApplyMode(M5GFX& disp) {
   Scene current = scenes[State::sceneIndex];
 
+  // Brightness arc indicator (around the perimeter)
+  uint16_t brightColor = colorTo565(0xf2a93b);
+  drawBrightnessArc(disp, State::brightness, brightColor);
+
   // Scene icon (centered)
   disp.setTextSize(5);
   disp.setTextColor(colorTo565(current.color), TFT_BLACK);
@@ -315,28 +373,30 @@ void displaySceneApplyMode(M5GFX& disp) {
 }
 
 void drawBrightnessArc(M5GFX& disp, uint8_t brightness, uint16_t color) {
-  uint16_t radius = 85;
+  uint16_t outerRadius = 110;
+  uint16_t innerRadius = 95;
   uint16_t cx = 120;
-  uint16_t cy = 145;
+  uint16_t cy = 120;
+  uint16_t darkGrey = colorTo565(0x222222);
 
-  // Background arc
-  for (int angle = 135; angle <= 405; angle += 8) {
+  // Background arc (full ring) - solid
+  for (int angle = 135; angle <= 405; angle += 1) {
     float rad = angle * PI / 180.0f;
-    int x1 = cx + radius * cos(rad);
-    int y1 = cy + radius * sin(rad);
-    int x2 = cx + (radius - 6) * cos(rad);
-    int y2 = cy + (radius - 6) * sin(rad);
-    disp.drawLine(x1, y1, x2, y2, TFT_DARKGREY);
+    int x1 = cx + outerRadius * cos(rad);
+    int y1 = cy + outerRadius * sin(rad);
+    int x2 = cx + innerRadius * cos(rad);
+    int y2 = cy + innerRadius * sin(rad);
+    disp.drawLine(x1, y1, x2, y2, darkGrey);
   }
 
-  // Brightness arc
+  // Brightness arc (filled portion) - solid
   int arcEnd = 135 + (270 * brightness / 100);
-  for (int angle = 135; angle <= arcEnd; angle += 8) {
+  for (int angle = 135; angle <= arcEnd; angle += 1) {
     float rad = angle * PI / 180.0f;
-    int x1 = cx + radius * cos(rad);
-    int y1 = cy + radius * sin(rad);
-    int x2 = cx + (radius - 6) * cos(rad);
-    int y2 = cy + (radius - 6) * sin(rad);
+    int x1 = cx + outerRadius * cos(rad);
+    int y1 = cy + outerRadius * sin(rad);
+    int x2 = cx + innerRadius * cos(rad);
+    int y2 = cy + innerRadius * sin(rad);
     disp.drawLine(x1, y1, x2, y2, color);
   }
 }
