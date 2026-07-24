@@ -38,7 +38,12 @@ public:
 
   // Scenes built from individual lights rather than groups list many more
   // entities, so this is sized for a room's worth of them.
-  static const int LIGHTS_LEN = 768;
+  static const int LIGHTS_LEN = 512;
+
+  // Limits are per area, not global - switching areas swaps the scene list.
+  static const int MAX_SCENES_PER_AREA = 8;
+  static const int MAX_AREAS = 6;
+  static const int MAX_SCENES = MAX_SCENES_PER_AREA * MAX_AREAS;
 
   struct Scene {
     char entityId[64];
@@ -106,7 +111,8 @@ public:
 
     Serial.printf("[HA] Payload (%d bytes): %s\n", payload.length(), payload.c_str());
 
-    DynamicJsonDocument doc(16384);
+    // Sized for MAX_SCENES entries each listing a room's worth of lights.
+    DynamicJsonDocument doc(32768);
     DeserializationError error = deserializeJson(doc, payload);
     if (error) {
       Serial.printf("[HA] JSON parse error: %s\n", error.c_str());
@@ -115,7 +121,7 @@ public:
 
     for (JsonObject item : doc.as<JsonArray>()) {
       if (sceneCount >= maxScenes) {
-        Serial.printf("[HA] Ignoring extra scenes beyond %d\n", maxScenes);
+        Serial.printf("[HA] Ignoring scenes beyond %d total\n", maxScenes);
         break;
       }
 
@@ -160,6 +166,24 @@ public:
       }
       scenes[j + 1] = key;
     }
+
+    // Enforce the per-area cap now that areas are contiguous, so one busy room
+    // can't crowd out another. Done after sorting so the kept scenes are stable.
+    int kept = 0, inArea = 0;
+    for (int i = 0; i < sceneCount; i++) {
+      bool newArea = (i == 0) || strcasecmp(scenes[i].area, scenes[i - 1].area) != 0;
+      if (newArea) inArea = 0;
+
+      if (inArea < MAX_SCENES_PER_AREA) {
+        if (kept != i) scenes[kept] = scenes[i];
+        kept++;
+        inArea++;
+      } else {
+        Serial.printf("[HA] Dropping %s - over %d scenes in %s\n",
+                      scenes[i].entityId, MAX_SCENES_PER_AREA, scenes[i].area);
+      }
+    }
+    sceneCount = kept;
 
     Serial.printf("[HA] Total scenes found: %d\n", sceneCount);
     return sceneCount > 0;

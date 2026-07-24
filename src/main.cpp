@@ -36,8 +36,8 @@ struct HAScene {
   char lights[HomeAssistantClient::LIGHTS_LEN];
 };
 
-const int MAX_SCENES = 8;
-const int MAX_AREAS = 6;
+const int MAX_SCENES = HomeAssistantClient::MAX_SCENES;
+const int MAX_AREAS = HomeAssistantClient::MAX_AREAS;
 
 HAScene haScenes[MAX_SCENES];
 int haSceneCount = 0;
@@ -236,9 +236,9 @@ void setup() {
 // Re-reads the labelled scene list so newly labelled scenes appear without a reboot.
 // Runs on the HA task; the fetch itself is unlocked, only the swap is guarded.
 void refreshScenes() {
-  static HomeAssistantClient::Scene fetched[8];  // static: too large for the task stack
+  static HomeAssistantClient::Scene fetched[MAX_SCENES];  // static: too large for the task stack
   int fetchedCount = 0;
-  if (!haClient.fetchAreaScenes(fetched, 8, fetchedCount)) return;
+  if (!haClient.fetchAreaScenes(fetched, MAX_SCENES, fetchedCount)) return;
 
   SCENES_LOCK();
   bool changed = (fetchedCount != haSceneCount);
