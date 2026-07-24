@@ -43,15 +43,19 @@ public:
   struct Scene {
     char entityId[64];
     char name[64];
+    char area[48];
     char lights[LIGHTS_LEN];  // comma-separated light entity ids in the scene
   };
 
-  // "Master Bedroom Rest" -> "Rest"
-  void stripAreaPrefix(const char* fullName, char* shortName, int maxLen) {
+  // "Master Bedroom Rest" in area "Master Bedroom" -> "Rest". The area is shown
+  // separately on screen, so repeating it in every scene name wastes the display.
+  void stripAreaPrefix(const char* fullName, const char* area, char* shortName, int maxLen) {
     const char* start = fullName;
-    size_t prefixLen = strlen(HA_NAME_PREFIX);
-    if (strncmp(fullName, HA_NAME_PREFIX, prefixLen) == 0 && fullName[prefixLen] != '\0') {
-      start = fullName + prefixLen;
+    size_t areaLen = strlen(area);
+    if (areaLen && strncasecmp(fullName, area, areaLen) == 0) {
+      const char* rest = fullName + areaLen;
+      while (*rest == ' ') rest++;
+      if (*rest) start = rest;
     }
     strncpy(shortName, start, maxLen - 1);
     shortName[maxLen - 1] = '\0';
@@ -80,6 +84,7 @@ public:
     reqDoc["template"] =
       "[{% for e in label_entities('" HA_SCENE_LABEL "') %}"
       "{\"id\":\"{{ e }}\",\"name\":\"{{ state_attr(e,'friendly_name') }}\","
+      "\"area\":\"{{ area_name(e) }}\","
       "\"lights\":\"{{ state_attr(e,'entity_id') | select('match','light\\\\.') | join(',') }}\"}"
       "{{ ',' if not loop.last }}"
       "{% endfor %}]";
@@ -117,11 +122,20 @@ public:
       const char* entityId = item["id"];
       const char* fullName = item["name"] | "Scene";
       const char* lights = item["lights"] | "";
+      const char* area = item["area"] | "";
       if (!entityId) continue;
+
+      // Scenes with no area would be unreachable once the UI is area-scoped
+      if (area[0] == '\0' || strcmp(area, "None") == 0) {
+        Serial.printf("[HA] Skipping %s - not assigned to an area\n", entityId);
+        continue;
+      }
 
       strncpy(scenes[sceneCount].entityId, entityId, 63);
       scenes[sceneCount].entityId[63] = '\0';
-      stripAreaPrefix(fullName, scenes[sceneCount].name, 64);
+      strncpy(scenes[sceneCount].area, area, 47);
+      scenes[sceneCount].area[47] = '\0';
+      stripAreaPrefix(fullName, area, scenes[sceneCount].name, 64);
       strncpy(scenes[sceneCount].lights, lights, LIGHTS_LEN - 1);
       scenes[sceneCount].lights[LIGHTS_LEN - 1] = '\0';
       if (strlen(lights) >= LIGHTS_LEN) {
@@ -132,12 +146,15 @@ public:
       Serial.printf("[HA] Added scene: %s (%s)\n", scenes[sceneCount - 1].name, entityId);
     }
 
-    // label_entities() has no defined order, so sort by name to keep the dial's
-    // scene positions stable across refreshes.
+    // label_entities() has no defined order, so sort by (area, name) to keep the
+    // dial's scene positions stable and to group each area contiguously.
     for (int i = 1; i < sceneCount; i++) {
       Scene key = scenes[i];
       int j = i - 1;
-      while (j >= 0 && strcasecmp(scenes[j].name, key.name) > 0) {
+      while (j >= 0) {
+        int cmp = strcasecmp(scenes[j].area, key.area);
+        if (cmp == 0) cmp = strcasecmp(scenes[j].name, key.name);
+        if (cmp <= 0) break;
         scenes[j + 1] = scenes[j];
         j--;
       }

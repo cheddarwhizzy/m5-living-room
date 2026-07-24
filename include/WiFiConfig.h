@@ -8,11 +8,8 @@
 // Home Assistant config
 #define HA_URL "https://home.cheddarwhizzy.com"
 #define HA_TOKEN "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIwNGUxNDI5MDM3NWI0N2E1YTQ1NTA0N2FkZGFjNDdmOSIsImlhdCI6MTc4NDg0NDU4NCwiZXhwIjoyMTAwMjA0NTg0fQ.8bzLCNLzkUDJdARXbCOc1JywIxa61S6IjQeMF2qLTsU"
-#define HA_AREA "master_bedroom_upstairs"
-
-// Scenes are selected by applying this label in Home Assistant
+// Scenes are selected by applying this label in Home Assistant. Areas are
+// derived from the labelled scenes, so no area list is configured here.
 #define HA_SCENE_LABEL "m5-dial"
-// Stripped from friendly names for display ("Master Bedroom Rest" -> "Rest")
-#define HA_NAME_PREFIX "Master Bedroom "
 
 #endif
