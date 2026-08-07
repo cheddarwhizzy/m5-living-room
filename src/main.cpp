@@ -17,6 +17,7 @@
 #include "../include/BuildInfo.h"
 #include "../include/WiFiConfig.h"
 #include "../include/HomeAssistant.h"
+#include "../include/OTAUpdate.h"
 
 // UI Modes
 enum UIMode {
@@ -209,6 +210,7 @@ void setup() {
 
   // Connect to WiFi and Home Assistant
   if (haClient.connectWiFi()) {
+    setupOTA();
     M5Dial.Display.fillScreen(TFT_BLACK);
     M5Dial.Display.drawString("Fetching scenes...", 120, 120);
     refreshScenes();
@@ -320,6 +322,7 @@ void haTask(void* param) {
 
 void loop() {
   M5Dial.update();
+  ArduinoOTA.handle();
 
   handleEncoder();
   handleButton();

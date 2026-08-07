@@ -12,4 +12,9 @@
 // derived from the labelled scenes, so no area list is configured here.
 #define HA_SCENE_LABEL "m5-dial"
 
+// Over-the-air update. The hostname is what `upload_port` resolves via mDNS,
+// and the password must match `upload_flags --auth` in platformio.ini.
+#define OTA_HOSTNAME "m5-living-room"
+#define OTA_PASSWORD "m5dial-ota"
+
 #endif
